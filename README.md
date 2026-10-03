@@ -135,10 +135,14 @@ Let $B$ be Batch Size, $S$ be Segment Length, $D=4096$, $H_q=32$, $H_{kv}=8$, $d
 * **$W_v \in \mathbb{R}^{D \times (H_{kv} \cdot d)} \to \mathbb{R}^{4096 \times 1024}$**
 * **$W_o \in \mathbb{R}^{(H_q \cdot d) \times D} \to \mathbb{R}^{4096 \times 4096}$**
 
-```text
-Q = h_norm1 · W_q   --> Shape: [B, 32, S, 128]
-K = h_norm1 · W_k   --> Shape: [B, 8, S, 128]
-V = h_norm1 · W_v   --> Shape: [B, 8, S, 128]
+```mermaid
+flowchart LR
+    H["Hidden state h_norm1"] --> Q["Q = h_norm1 × W_q<br/>[B, 32, S, 128]"]
+    H --> K["K = h_norm1 × W_k<br/>[B, 8, S, 128]"]
+    H --> V["V = h_norm1 × W_v<br/>[B, 8, S, 128]"]
+    Q --> QH["32 Query Heads"]
+    K --> KH["8 KV Heads"]
+    V --> KH
 ```
 
 #### Grouped-Query Attention (GQA) Memory Mapping:
@@ -204,19 +208,17 @@ $$\sigma(x) = \text{ELU}(x) + 1.0 = \begin{cases} x + 1.0 & \text{if } x > 0 \\ 
 * **Mathematical Role:** Unlike standard ReLU, $\sigma(x) > 0 \;\forall\; x \in \mathbb{R}$, eliminating zero-gradient regions for inactive queries and maintaining strictly positive associative normalizers.
 
 ### 5.2 Implementation Tensor Sequence (Memory Read)
-```text
-Inputs:
-  Q:          [B, 32, S, 128] (bfloat16)
-  M_{t-1}:    [B, 8, 128, 128] (float32)
-  z_{t-1}:    [B, 8, 128, 1] (float32)
-
-Operations:
-  Q_g = Q.view(B, 8, 4, S, 128).to(torch.float32)
-  σ_Q = torch.nn.functional.elu(Q_g) + 1.0                --> [B, 8, 4, S, 128]
-  Num = torch.matmul(σ_Q, M_{t-1}.unsqueeze(2))          --> [B, 8, 4, S, 128]
-  Den = torch.matmul(σ_Q, z_{t-1}.unsqueeze(2)).clamp(min=1e-6) --> [B, 8, 4, S, 1]
-  A_mem_g = Num / Den                                     --> [B, 8, 4, S, 128]
-  A_mem = A_mem_g.view(B, 32, S, 128).to(torch.bfloat16)  --> [B, 32, S, 128]
+```mermaid
+flowchart TD
+    Q["Q<br/>[B, 32, S, 128]<br/>BF16"] --> G["GQA reshape<br/>[B, 8, 4, S, 128]<br/>FP32"]
+    M["M(t-1)<br/>[B, 8, 128, 128]<br/>FP32"] --> N["Numerator"]
+    Z["z(t-1)<br/>[B, 8, 128, 1]<br/>FP32"] --> D["Denominator"]
+    G --> K["σ(Q) = ELU(Q) + 1"]
+    K --> N
+    K --> D
+    N --> R["A_mem_g = Num / Den"]
+    D --> R
+    R --> O["A_mem<br/>[B, 32, S, 128]<br/>BF16"]
 ```
 
 ---
