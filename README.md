@@ -64,7 +64,7 @@ flowchart TD
         LA --> Adot["Local output A_dot"]
         Q --> KQ["Kernel σ(Q)=ELU(Q)+1"]
         KQ --> Read["Associative Memory Read"]
-        SM -.->|M(t-1), z(t-1)| Read
+        SM -.->|Previous memory state M and z| Read
         Read --> Amem["Memory output A_mem"]
         Adot --> Gate["Mixing Gate σ(β)"]
         Amem --> Gate
@@ -78,7 +78,7 @@ flowchart TD
         WG --> Update["Delta-Rule Memory Update"]
         Surprise --> Update
         KK --> Update
-        SM -.->|M(t-1), z(t-1)| Update
+        SM -.->|Previous memory state M and z| Update
         Update --> State["Updated M(t), z(t)"]
         State -->|Commit| NMB
         WO --> Res1["Residual + x_l"]
