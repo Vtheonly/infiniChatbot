@@ -50,48 +50,42 @@ Standard autoregressive Transformers maintain multi-turn context via the Key-Val
 ## 2. Final System Architecture
 
 ```mermaid
-graph TD
-    subgraph "External Host & Memory Registry"
-        NMB[NeuralMemoryBank In-VRAM Storage] -->|Pointer Hot-Swap M, z| SM[InfiniAttentionSurgery Module]
+flowchart TD
+    subgraph Host["External Host & Memory Registry"]
+        NMB["NeuralMemoryBank<br/>In-VRAM Storage"] -->|Pointer hot-swap M,z| SM["InfiniAttentionSurgery"]
     end
-
-    subgraph "Surgical Transformer Layer (Layers 16-27)"
-        In[Input Hidden State x_l] --> LN1[Input Layer RMSNorm]
-        LN1 --> Proj[Linear Projections W_q, W_k, W_v]
-        
-        Proj -->|Q| Q_split[32 Query Heads]
-        Proj -->|K, V| KV_split[8 KV Heads]
-        
-        %% Local Attention Branch
-        Q_split & KV_split --> LocalAttn[Flash-Local Causal Attention]
-        LocalAttn --> A_dot[Local Context Output A_dot]
-        
-        %% Memory Read Branch
-        Q_split --> KernelQ[ELU + 1 Feature Map σ Q]
-        SM -.->|M_t-1, z_t-1| MemRead[Associative Linear Read]
-        KernelQ --> MemRead
-        MemRead --> A_mem[Memory Retrieval Output A_mem]
-        
-        %% Gating
-        A_dot & A_mem --> MixGate[Mixing Gate: σ β]
-        MixGate --> CombinedAttn[Fused Head Output A]
-        CombinedAttn --> OutProj[W_o Projection]
-        
-        %% Memory Write Branch
-        KV_split --> KernelK[ELU + 1 Feature Map σ K]
-        KernelK & KV_split --> Surprise[Surprise Calc: ΔV = V - V_pred]
-        In --> WriteGate[Sparse Write Gate g_t]
-        Surprise & WriteGate --> DeltaUpdate[Associative Delta-Rule Update]
-        SM -.->|M_t-1, z_t-1| DeltaUpdate
-        DeltaUpdate -->|M_t, z_t| OutState[Updated In-Memory Buffers]
-        OutState -->|Commit State| NMB
-        
-        %% Residuals & FFN
-        OutProj --> Res1[Residual Addition + x_l]
-        Res1 --> LN2[Post-Attention RMSNorm]
-        LN2 --> MLP[SwiGLU FFN Layer]
-        MLP --> Res2[Residual Addition]
-        Res2 --> Out[Output Hidden State x_l+1]
+    subgraph Surg["Surgical Transformer Layers 16-27"]
+        In["Input hidden state x_l"] --> LN1["Input RMSNorm"]
+        LN1 --> Proj["W_q / W_k / W_v projections"]
+        Proj --> Q["32 Query Heads"]
+        Proj --> KV["8 KV Heads"]
+        Q --> LA["Flash Local Causal Attention"]
+        KV --> LA
+        LA --> Adot["Local output A_dot"]
+        Q --> KQ["Kernel σ(Q)=ELU(Q)+1"]
+        KQ --> Read["Associative Memory Read"]
+        SM -.->|M(t-1), z(t-1)| Read
+        Read --> Amem["Memory output A_mem"]
+        Adot --> Gate["Mixing Gate σ(β)"]
+        Amem --> Gate
+        Gate --> Comb["Fused attention output A"]
+        Comb --> WO["W_o projection"]
+        KV --> KK["Kernel σ(K)=ELU(K)+1"]
+        KK --> Pred["Predict V_pred"]
+        KV --> Pred
+        Pred --> Surprise["Surprise ΔV = V - V_pred"]
+        In --> WG["Sparse Write Gate g_t"]
+        WG --> Update["Delta-Rule Memory Update"]
+        Surprise --> Update
+        KK --> Update
+        SM -.->|M(t-1), z(t-1)| Update
+        Update --> State["Updated M(t), z(t)"]
+        State -->|Commit| NMB
+        WO --> Res1["Residual + x_l"]
+        Res1 --> LN2["Post-Attention RMSNorm"]
+        LN2 --> MLP["SwiGLU FFN"]
+        MLP --> Res2["Residual Addition"]
+        Res2 --> Out["Output hidden state x_(l+1)"]
     end
 ```
 
@@ -193,25 +187,15 @@ Memory in `Project Chronos-NLME` is defined as a **per-KV-head, per-layer contin
 
 Retrieval from continuous latent memory maps transformed queries against the current associative state before combining with the local causal context.
 
-```
-Incoming Query Tensor Q: [B, 32, S, 128]
-          │
-          ▼
-Reshape to GQA Groups: [B, 8, 4, S, 128]
-          │
-          ▼
-Kernel Transform: σ(Q) = ELU(Q) + 1.0  --> [B, 8, 4, S, 128] (FP32)
-          │
-          ├────────────────────────────────────────┐
-          │                                        │
-          ▼                                        ▼
-Numerator: Num = σ(Q) @ M_{t-1}          Denominator: Den = σ(Q) @ z_{t-1}
-Shape: [B, 8, 4, S, 128]                 Shape: [B, 8, 4, S, 1]
-          │                                        │
-          └───────────────────┬────────────────────┘
-                              │
-                              ▼
-        A_mem = Num / clamp(Den, min=1e-6)  --> Reshape: [B, 32, S, 128]
+```mermaid
+flowchart TD
+    Q["Incoming Query Tensor Q<br/>[B, 32, S, 128]"] --> G["Reshape to GQA Groups<br/>[B, 8, 4, S, 128]"]
+    G --> K["Kernel Transform<br/>σ(Q) = ELU(Q) + 1.0<br/>FP32"]
+    K --> N["Numerator<br/>Num = σ(Q) @ M(t-1)<br/>[B, 8, 4, S, 128]"]
+    K --> D["Denominator<br/>Den = σ(Q) @ z(t-1)<br/>[B, 8, 4, S, 1]"]
+    N --> O["A_mem = Num / clamp(Den, min=1e-6)"]
+    D --> O
+    O --> R["Reshape<br/>[B, 32, S, 128]"]
 ```
 
 ### 5.1 Kernel Feature Formulation
@@ -242,22 +226,20 @@ Operations:
 Information entry is governed by an error-correction delta update, a token-level sparse write gate, and an adaptive temporal decay parameter.
 
 ```mermaid
-graph TD
-    InK[K Tensor: B, 8, S, 128] & InV[V Tensor: B, 8, S, 128] --> KernelK[Compute σ K = ELU K + 1]
-    
-    KernelK & InV --> Pred[Predict Existing Memory Output: V_pred]
-    Pred --> Diff[Compute Surprise Residual: ΔV = V - V_pred]
-    
-    RawInput[Layer Hidden State x_norm] --> LinGate[W_gate Projection]
-    LinGate --> Sigmoid[Sigmoid Activation] --> Gate[Sparse Token Gate: g_t ∈ 0, 1]
-    
-    Gate & KernelK --> GatedK[Modulate Keys: σ_K_g = g_t · σ K]
-    
-    GatedK & Diff --> OuterProd[Outer Product Accumulation: σ_K_g ^T @ ΔV]
-    OuterProd --> DeltaM[Candidate Update ΔM]
-    
-    DeltaM --> DecayStep[Apply Trace Decay: 1 - λ M_t-1 + ΔM]
-    DecayStep --> Commit[Write to Active Memory: M_t, z_t]
+flowchart TD
+    K["K tensor<br/>[B,8,S,128]"] --> KK["Kernel σ(K)=ELU(K)+1"]
+    V["V tensor<br/>[B,8,S,128]"] --> Pred["Predict existing memory V_pred"]
+    KK --> Pred
+    Pred --> Diff["Surprise residual<br/>ΔV = V - V_pred"]
+    X["Layer hidden state x_norm"] --> WG["W_gate projection"]
+    WG --> Sig["Sigmoid"] --> Gate["Sparse token gate g_t"]
+    Gate --> GK["Gated keys<br/>σ(K_g)=g_t·σ(K)"]
+    KK --> GK
+    GK --> OP["Outer-product accumulation<br/>σ(K_g)^T @ ΔV"]
+    Diff --> OP
+    OP --> DM["Candidate ΔM"]
+    DM --> Decay["Trace decay<br/>(1-λ_t)M_(t-1)+ΔM"]
+    Decay --> Commit["Commit active memory<br/>M_t, z_t"]
 ```
 
 ### 6.1 Algorithmic Write Pipeline
@@ -368,24 +350,16 @@ $$M = \text{clamp}(M, -65504.0, 65504.0)$$
 
 `Chronos-NLME` uses two distinct, non-overlapping gating mechanisms:
 
-```
-                      Layer Input Activation x
-                                 │
-              ┌──────────────────┴──────────────────┐
-              ▼                                     ▼
-       Attention Block                     Write Gate Module
-              │                          g_t = σ(W_gate · x_t)
-              ▼                                     │
-      Attention Forward                             │
-       ├─ A_dot (Local Causal)                      │
-       └─ A_mem (Associative Memory)                ▼
-              │                            Modulates writes to M
-              ▼
-   Local-vs-Memory Gate (β)
-A = σ(β)·A_mem + (1-σ(β))·A_dot
-              │
-              ▼
-      W_o Out Projection
+```mermaid
+flowchart TD
+    X["Layer Input Activation x"] --> A["Attention Block"]
+    X --> W["Write Gate Module<br/>g_t = σ(W_gate · x_t)"]
+    A --> L["Local Causal Attention<br/>A_dot"]
+    A --> M["Associative Memory<br/>A_mem"]
+    L --> F["Local-vs-Memory Gate β<br/>A = σ(β)·A_mem + (1-σ(β))·A_dot"]
+    M --> F
+    W --> G["Modulates writes to M"]
+    F --> O["W_o Output Projection"]
 ```
 
 ### 11.1 The Local-vs-Memory Mixing Gate ($\beta$)
@@ -524,26 +498,14 @@ Let $N$ be total sequence length, $S$ segment length ($S = 2048, S \ll N$), $D$ 
 
 ### 17.1 Two-Phase Training Regime
 
-```
-                       Phase 1: Zero-Destruction Gate Alignment
-                                 (Duration: 2,500 Steps)
-                                            │
-              ┌─────────────────────────────┴─────────────────────────────┐
-              ▼                                                           ▼
-     [FROZEN: 99.998% Weights]                                  [TRAINABLE: 0.002%]
-     - Base Transformer MLPs                                    - Head Gates β
-     - Projections (W_q, W_k, W_v, W_o)                         - Sparse Write Gates W_gate
-     - RMSNorm Layers & Embeddings                              - LoRA adapters on W_q, W_k
-                                            │
-                                            ▼
-                       Phase 2: Joint End-to-End Distillation
-                                 (Duration: 10,000 Steps)
-                                            │
-              ┌─────────────────────────────┴─────────────────────────────┐
-              ▼                                                           ▼
-     [TEACHER: Fully Frozen]                                    [STUDENT: Active Network]
-     Standard Base LLaMA-3-8B                                   NLME Surgical Model
-     (Outputs Target Logits P_teacher)                          Objective: L_NLL + L_KD + L_sparse
+```mermaid
+flowchart TD
+    P1["Phase 1: Zero-Destruction Gate Alignment<br/>2,500 steps"] --> F["Frozen: 99.998% Weights<br/>Base MLPs, W_q/W_k/W_v/W_o, RMSNorm, embeddings"]
+    P1 --> T["Trainable: 0.002%<br/>Head gates β, sparse write gates, LoRA adapters"]
+    F --> P2["Phase 2: Joint End-to-End Distillation<br/>10,000 steps"]
+    T --> P2
+    P2 --> TE["Teacher: Fully Frozen<br/>Standard Base LLaMA-3-8B<br/>Target logits P_teacher"]
+    P2 --> ST["Student: Active Network<br/>NLME Surgical Model<br/>Objective: L_NLL + L_KD + L_sparse"]
 ```
 
 ### 17.2 Hyperparameter Configuration
@@ -562,21 +524,18 @@ Let $N$ be total sequence length, $S$ segment length ($S = 2048, S \ll N$), $D$ 
 
 ```mermaid
 sequenceDiagram
-    participant D as Data Stream (Segmented Document)
-    participant S1 as Segment 1 [Tokens 0..2047]
-    participant S2 as Segment 2 [Tokens 2048..4095]
-    participant M as In-Memory State Register
-
-    D->>S1: Forward Pass Segment 1
-    Note over S1: Initial State: M_0 = 0, z_0 = 0
-    S1->>M: Emits M_1, z_1 (Retains Graph)
-    
-    D->>S2: Forward Pass Segment 2
-    M->>S2: Injects M_1, z_1
-    Note over S2: Loss Backpropagates through S2 into M_1
-    S2->>M: Emits M_2, z_2 (Detach M_1)
-    
-    Note over M: BPTT Horizon Bounded to 1 Boundary
+    participant D as Data Stream
+    participant S1 as Segment 1
+    participant S2 as Segment 2
+    participant M as Memory State
+    D->>S1: Forward segment 1
+    Note over S1: M0=0, z0=0
+    S1->>M: Emit M1, z1
+    D->>S2: Forward segment 2
+    M->>S2: Inject M1, z1
+    Note over S2: Loss backpropagates through the boundary
+    S2->>M: Emit M2, z2
+    Note over M: Detach state after the bounded BPTT horizon
 ```
 
 ### Recurrence Rules
@@ -591,14 +550,11 @@ The optimization target combines next-token prediction, knowledge distillation, 
 
 $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{NLL}} + \lambda_{\text{KD}} \mathcal{L}_{\text{KD}} + \lambda_{\text{sparse}} \mathcal{L}_{\text{sparse}}$$
 
-```
-                       Composite Optimization Objective
-                                      │
-     ┌────────────────────────────────┼────────────────────────────────┐
-     ▼                                ▼                                ▼
-Language Model Loss        KL Distillation Anchor             Sparsity Penalty
-  L_NLL (Cross-Entropy)      L_KD = D_KL(P_s || P_t)           L_sparse = (1/S) Σ |g_t|
-  Weight: 1.0                Weight: 0.5                       Weight: 0.05
+```mermaid
+flowchart TD
+    C["Composite Optimization Objective"] --> N["Language Model Loss<br/>L_NLL (Cross-Entropy)<br/>Weight: 1.0"]
+    C --> K["KL Distillation Anchor<br/>L_KD = D_KL(P_s || P_t)<br/>Weight: 0.5"]
+    C --> S["Sparsity Penalty<br/>L_sparse = (1/S) Σ |g_t|<br/>Weight: 0.05"]
 ```
 
 ### 1. Cross-Entropy Loss ($\mathcal{L}_{\text{NLL}}$)
@@ -616,35 +572,16 @@ Penalizes gate activations, forcing the model to write only when information is 
 
 ## 20. Memory Lifecycle
 
-```
-    ┌──────────────┐
-    │ Unallocated  │  create_blank_state() -> M = 0, z = 0
-    └──────┬───────┘
-           │
-           ▼
-    ┌──────────────┐
-    │ Active VRAM  │ <───────────────────────────────────┐
-    └──────┬───────┘                                     │
-           │                                             │
-      Forward Pass (Read A_mem, Delta-Rule Update)       │
-           │                                             │
-           ▼                                             │
-    ┌──────────────┐                                     │
-    │  Committed   │  commit_state() -> Registry Pointer │
-    └──────┬───────┘                                     │
-           │                                             │
-           ├──────────────────┬──────────────────────────┤
-           ▼                  ▼                          │
-    ┌──────────────┐   ┌──────────────┐                  │
-    │  Snapshotted │   │   Branched   │                  │
-    │ (Disk Cache) │   │ (CoW Clone)  │                  │
-    └──────────────┘   └──────┬───────┘                  │
-                              │                          │
-                              ▼                          │
-                       ┌──────────────┐                  │
-                       │ Latent Merge │ ─────────────────┘
-                       │ α·M_A+(1-α)M_B (Experimental)
-                       └──────────────┘
+```mermaid
+flowchart TD
+    U["Unallocated<br/>create_blank_state() → M=0, z=0"] --> A["Active VRAM"]
+    A --> C["Committed<br/>commit_state() → Registry Pointer"]
+    C --> R["Read / Write During Forward Pass"]
+    R --> C
+    C --> D["Disk Snapshot"]
+    C --> B["Branched<br/>Copy-on-Write Clone"]
+    B --> M["Latent Merge<br/>α·M_A + (1-α)·M_B<br/>Experimental"]
+    M --> A
 ```
 
 ### Lifecycle States
@@ -758,45 +695,43 @@ Continuous linear associative memory is an **approximate semantic filter**. Oute
 
 ## 24. Full Software / Repository Architecture
 
-```text
-chronos-nlme/
-├── configs/
-│   ├── llama3_8b_surgery.json       # Surgical layer indices, GQA head ratios
-│   ├── train_phase1_gates.json      # Gate initialization hyperparameters
-│   └── train_phase2_distill.json    # Distillation and LoRA configurations
-├── src/
-│   ├── model/
-│   │   ├── __init__.py
-│   │   ├── surgical_attention.py    # InfiniAttentionSurgery class implementation
-│   │   ├── kernel_maps.py           # Differentiable ELU+1 kernel implementations
-│   │   └── patcher.py               # Computational graph graft scripts for HF models
-│   ├── memory/
-│   │   ├── __init__.py
-│   │   ├── memory_bank.py           # NeuralMemoryBank in-VRAM registry manager
-│   │   ├── state_serializers.py     # Safetensors serialization utilities
-│   │   └── delta_rule.py            # PyTorch associative delta-rule operations
-│   ├── data/
-│   │   ├── tokenization.py          # Fixed-window chunking and batch padding
-│   │   ├── administrative_prep.py   # Ingestion for enterprise billing and legal text
-│   │   └── passkey_generator.py     # Synthetic needle-in-haystack benchmark sets
-│   ├── training/
-│   │   ├── train_segmented.py       # Segmented recurrence BPTT training loop
-│   │   ├── distillation_loss.py     # Forward KL divergence implementation
-│   │   └── gate_regularizers.py     # L1 sparsity losses and decay monitors
-│   └── evaluation/
-│       ├── needle_eval.py           # Synthetic long-horizon passkey retrieval harness
-│       ├── perplexity_eval.py       # Sliding-window perplexity evaluation
-│       └── capability_eval.py       # LM-Eval-Harness integration (MMLU / GSM8k)
-├── scripts/
-│   ├── run_surgery.py               # Patches pretrained Hugging Face weights
-│   ├── run_training.py              # CLI training orchestrator
-│   └── evaluate_checkpoint.py       # Execution pipeline for evaluation battery
-├── tests/
-│   ├── test_zero_destruction.py     # Unit test: validates bit-identical outputs at step 0
-│   ├── test_memory_bank.py          # Unit test: verifies memory snapshot isolation
-│   └── test_shapes.py               # Unit test: dimension audit for attention forward pass
-├── pyproject.toml                   # Build specifications and pinned dependencies
-└── README.md                        # Quickstart guide and architectural synopsis
+```mermaid
+flowchart TD
+    Root["chronos-nlme/"] --> Config["configs/"]
+    Config --> C1["llama3_8b_surgery.json"]
+    Config --> C2["train_phase1_gates.json"]
+    Config --> C3["train_phase2_distill.json"]
+    Root --> Src["src/"]
+    Src --> Model["model/"]
+    Model --> M1["surgical_attention.py"]
+    Model --> M2["kernel_maps.py"]
+    Model --> M3["patcher.py"]
+    Src --> Memory["memory/"]
+    Memory --> Me1["memory_bank.py"]
+    Memory --> Me2["state_serializers.py"]
+    Memory --> Me3["delta_rule.py"]
+    Src --> Data["data/"]
+    Data --> D1["tokenization.py"]
+    Data --> D2["administrative_prep.py"]
+    Data --> D3["passkey_generator.py"]
+    Src --> Training["training/"]
+    Training --> T1["train_segmented.py"]
+    Training --> T2["distillation_loss.py"]
+    Training --> T3["gate_regularizers.py"]
+    Src --> Eval["evaluation/"]
+    Eval --> E1["needle_eval.py"]
+    Eval --> E2["perplexity_eval.py"]
+    Eval --> E3["capability_eval.py"]
+    Root --> Scripts["scripts/"]
+    Scripts --> S1["run_surgery.py"]
+    Scripts --> S2["run_training.py"]
+    Scripts --> S3["evaluate_checkpoint.py"]
+    Root --> Tests["tests/"]
+    Tests --> X1["test_zero_destruction.py"]
+    Tests --> X2["test_memory_bank.py"]
+    Tests --> X3["test_shapes.py"]
+    Root --> Meta["pyproject.toml"]
+    Root --> Readme["README.md"]
 ```
 
 ---
@@ -812,20 +747,13 @@ chronos-nlme/
 
 ## 26. Data Pipeline
 
-```
-Raw Administrative Invoices, Filings, and Statutes (PDF, Text, JSON)
-                         │
-                         ▼
-Text Normalization (Arabic / French / English bilingual character cleanup)
-                         │
-                         ▼
-Tokenization via LLaMA-3 BPE (Vocabulary: 128,256 tokens)
-                         │
-                         ▼
-Fixed-Length Window Segment Chunking (Window S = 2048 Tokens)
-                         │
-                         ▼
-Batch Assembly: [B, Num_Segments, S] --> Transferred to Target Device
+```mermaid
+flowchart TD
+    Raw["Raw Administrative Invoices, Filings, and Statutes<br/>PDF, Text, JSON"] --> Norm["Text Normalization<br/>Arabic / French / English cleanup"]
+    Norm --> Tok["LLaMA-3 BPE Tokenization<br/>Vocabulary: 128,256"]
+    Tok --> Seg["Fixed-Length Window Chunking<br/>S = 2048 tokens"]
+    Seg --> Batch["Batch Assembly<br/>[B, Num_Segments, S]"]
+    Batch --> Device["Transfer to Target Device"]
 ```
 
 ### Contamination & Leakage Prevention
@@ -849,15 +777,20 @@ Batch Assembly: [B, Num_Segments, S] --> Transferred to Target Device
 
 ## 28. Evaluation Framework
 
-```
-                         Comprehensive Evaluation Battery
-                                        │
-        ┌───────────────────────────────┼───────────────────────────────┐
-        ▼                               ▼                               ▼
-Capability Preservation         Memory Retention                State Efficiency
-- MMLU (Zero-Shot)              - Synthetic Passkey Retrieval   - VRAM Scaling vs N
-- GSM8k Reasoning               - Perplexity vs Context Depth   - Context Swap Time (ms)
-- Output KL Divergence          - Entity Update Accuracy        - Snapshot Storage (MB)
+```mermaid
+flowchart TD
+    E["Comprehensive Evaluation Battery"] --> C["Capability Preservation"]
+    E --> R["Memory Retention"]
+    E --> S["State Efficiency"]
+    C --> C1["MMLU zero-shot"]
+    C --> C2["GSM8k reasoning"]
+    C --> C3["Output KL divergence"]
+    R --> R1["Synthetic passkey retrieval"]
+    R --> R2["Perplexity vs context depth"]
+    R --> R3["Entity update accuracy"]
+    S --> S1["VRAM scaling vs N"]
+    S --> S2["Context swap time"]
+    S --> S3["Snapshot storage"]
 ```
 
 ### Concrete Evaluation Targets:
@@ -950,19 +883,19 @@ Capability Preservation         Memory Retention                State Efficiency
 
 ## 33. Checkpoint Architecture
 
-```
-Chronos Checkpoint Package (.chronos)
-├── base_model/               # Base LLaMA-3-8B BF16 Weights
-│   ├── model.safetensors
-│   └── config.json
-├── surgery_adapters/         # Trainable Adapters & Gating Weights (~1.4 MB)
-│   ├── beta_scalars.pt       # [12, 1, 32, 1, 1] Head mixing parameters
-│   ├── write_gates.pt        # [12, 1, 4096] Sparse gate linear weights
-│   ├── decay_projs.pt        # [12, 1, 4096] Adaptive decay weights
-│   └── lora_adapters.pt      # LoRA adapters on W_q, W_k
-└── memory_snapshots/         # Dynamic Context Snapshots
-    ├── sonelgaz_dispute.nlme # 3.025 MB (BF16 M and z states for 12 layers)
-    └── audit_ledger.nlme     # 3.025 MB
+```mermaid
+flowchart TD
+    Root["Chronos Checkpoint Package (.chronos)"] --> Base["base_model/"]
+    Base --> B1["model.safetensors"]
+    Base --> B2["config.json"]
+    Root --> Adapters["surgery_adapters/<br/>~1.4 MB"]
+    Adapters --> A1["beta_scalars.pt"]
+    Adapters --> A2["write_gates.pt"]
+    Adapters --> A3["decay_projs.pt"]
+    Adapters --> A4["lora_adapters.pt"]
+    Root --> Snap["memory_snapshots/"]
+    Snap --> S1["sonelgaz_dispute.nlme<br/>3.025 MB"]
+    Snap --> S2["audit_ledger.nlme<br/>3.025 MB"]
 ```
 
 ### Experiment Reproduction Tuple
@@ -973,30 +906,19 @@ $$\text{Execution State} = \langle \text{Git Commit SHA}, \text{Base Checkpoint}
 
 ## 34. Inference Architecture
 
-```
-Incoming User Query / Next Token Request
-                 │
-                 ▼
-Fetch Active Session ID -> Retrieve (M, z) from NeuralMemoryBank
-                 │
-                 ▼
-Load Tensors into Active Memory Pointers (In-place CUDA reference)
-                 │
-                 ▼
-Execute Autoregressive Forward Pass (torch.inference_mode())
-   ├─ Read Context from M_{t-1}
-   ├─ Compute Next-Token Logits
-   └─ Evaluate Sparse Write Gate:
-          If Novel Context Detected (g_t > threshold):
-              Compute Delta-Rule Update (M_t, z_t) in-place
-          Else:
-              Retain M_t = M_{t-1}, z_t = z_{t-1}
-                 │
-                 ▼
-Emit Predicted Token -> Yield to Stream
-                 │
-                 ▼
-Commit updated (M_t, z_t) references to NeuralMemoryBank
+```mermaid
+flowchart TD
+    Q["Incoming User Query / Next Token Request"] --> F["Fetch Active Session ID<br/>Retrieve (M, z)"]
+    F --> L["Load Tensors into Active Memory Pointers<br/>In-place CUDA reference"]
+    L --> P["Autoregressive Forward Pass<br/>torch.inference_mode()"]
+    P --> Read["Read Context from M(t-1)"]
+    P --> Logits["Compute Next-Token Logits"]
+    P --> Gate["Evaluate Sparse Write Gate"]
+    Gate -->|Novel context| Update["Delta-Rule Update<br/>M(t), z(t)"]
+    Gate -->|No novel context| Retain["Retain M(t)=M(t-1), z(t)=z(t-1)"]
+    Update --> Emit["Emit Predicted Token"]
+    Retain --> Emit
+    Emit --> Commit["Commit updated (M, z)<br/>to NeuralMemoryBank"]
 ```
 
 ---
@@ -1064,15 +986,17 @@ Commit updated (M_t, z_t) references to NeuralMemoryBank
 
 ## 39. What Has Actually Been Proven
 
-```
-                                 Evidence Ledger
-                                        │
-      ┌─────────────────────────────────┼─────────────────────────────────┐
-      ▼                                 ▼                                 ▼
-Fully Proven                    Partially Validated               Hypothesis Only
-- Zero-Destruction at β=-6.0    - Needle Passkey at 32k           - Linear Vector Merging
-- O(1) Memory Footprint         - Sparse Gate Sparsity              Without Interference
-- Sub-2ms Context Swapping
+```mermaid
+flowchart TD
+    E["Evidence Ledger"] --> P["Fully Proven"]
+    E --> V["Partially Validated"]
+    E --> H["Hypothesis Only"]
+    P --> P1["Zero-Destruction at β=-6.0"]
+    P --> P2["O(1) Memory Footprint"]
+    P --> P3["Sub-2ms Context Swapping"]
+    V --> V1["Needle Passkey at 32k"]
+    V --> V2["Sparse Gate Sparsity"]
+    H --> H1["Linear Vector Merging<br/>Without Interference"]
 ```
 
 ### Empirical Audit:
@@ -1086,31 +1010,26 @@ Fully Proven                    Partially Validated               Hypothesis Onl
 
 ## 40. Final System Blueprint
 
-```
-FINAL OPERATIONAL SPECIFICATION: PROJECT CHRONOS-NLME
-
-1. THE BACKBONE
-   - Model: Meta-Llama-3-8B (Layers 0-15 and 28-31 Unmodified)
-   - Surgical Layers: Layers 16 through 27 Replaced with InfiniAttentionSurgery
-   - Linear Feature Kernel: σ(x) = ELU(x) + 1.0 (FP32)
-   - State Tracking: Maintained per KV-Head (H_kv = 8): M ∈ R[8, 128, 128], z ∈ R[8, 128, 1]
-
-2. THE WRITE LOGIC
-   - Filter 1 (Write Gate): g_t = sigmoid(W_gate · x_t) with L1 Sparsity
-   - Filter 2 (Surprise Check): ΔV = V - (σ(K)M_{t-1}) / (σ(K)z_{t-1})
-   - Update Equation: M_t = (1 - λ_t)M_{t-1} + σ(K_g)^T ΔV
-   - Normalizer Equation: z_t = (1 - λ_t)z_{t-1} + Σ σ(K_g)^T
-
-3. THE READ & GATING LOGIC
-   - GQA Memory Lookup: A_mem = (σ(Q_grouped)M_{t-1}) / clamp(σ(Q_grouped)z_{t-1}, min=1e-6)
-   - Local Attention: A_dot = FlashAttention2(Q, K, V)
-   - Context Fusion: A_comb = sigmoid(β) · A_mem + (1 - sigmoid(β)) · A_dot
-   - Baseline Anchor: β = -6.0 (Guarantees baseline preservation at initialization)
-
-4. STATE PERSISTENCE & RUNTIME
-   - Memory State Footprint: 6.05 MB (FP32) / 3.025 MB (BF16) per 12-layer snapshot
-   - Storage Engine: NeuralMemoryBank (CUDA/VRAM Pointers)
-   - Runtime Latencies: Pointer swap < 2ms, zero prompt re-computation overhead
+```mermaid
+flowchart TD
+    Root["Project Chronos-NLME<br/>Final Operational Specification"] --> B["1. Backbone"]
+    Root --> W["2. Write Logic"]
+    Root --> G["3. Read & Gating Logic"]
+    Root --> R["4. State Persistence & Runtime"]
+    B --> B1["Meta-Llama-3-8B<br/>Layers 0-15 and 28-31 unmodified"]
+    B --> B2["Surgical Layers 16-27<br/>InfiniAttentionSurgery"]
+    B --> B3["Kernel σ(x)=ELU(x)+1.0<br/>FP32"]
+    B --> B4["Per KV head: H_kv=8<br/>M ∈ R[8,128,128], z ∈ R[8,128,1]"]
+    W --> W1["Write Gate<br/>g_t = sigmoid(W_gate · x_t)"]
+    W --> W2["Surprise Check<br/>ΔV = V - V_pred"]
+    W --> W3["Delta Update<br/>M_t = (1-λ_t)M_(t-1) + σ(K_g)^TΔV"]
+    G --> G1["GQA Memory Lookup<br/>A_mem = σ(Q)M / clamp(σ(Q)z)"]
+    G --> G2["Local Attention<br/>A_dot = FlashAttention2(Q,K,V)"]
+    G --> G3["Fusion<br/>A_comb = sigmoid(β)A_mem + (1-sigmoid(β))A_dot"]
+    G --> G4["Baseline Anchor<br/>β=-6.0"]
+    R --> R1["State Footprint<br/>6.05 MB FP32 / 3.025 MB BF16"]
+    R --> R2["NeuralMemoryBank<br/>CUDA/VRAM pointers"]
+    R --> R3["Pointer swap < 2 ms<br/>No prompt recomputation"]
 ```
 
 ---
